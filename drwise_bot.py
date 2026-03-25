@@ -60,6 +60,10 @@ def get_recent_health(days=7):
     return {k: v for k, v in data.items() if k >= cutoff}
 
 
+def get_today_health():
+    return load_json(HEALTH_FILE).get(str(date.today()), {})
+
+
 def save_meal(meal):
     data = load_json(MEALS_FILE)
     today = str(date.today())
@@ -80,8 +84,20 @@ def get_today_meals():
     return load_json(MEALS_FILE).get(str(date.today()), [])
 
 
-def get_today_health():
-    return load_json(HEALTH_FILE).get(str(date.today()), {})
+def truncate_health(health_data, max_chars=8000):
+    """Truncate health data to avoid hitting Claude's token limit."""
+    raw = json.dumps(health_data, default=str)
+    if len(raw) <= max_chars:
+        return health_data
+    # Too large — summarize by keeping only today + yesterday
+    today = str(date.today())
+    yesterday = str(date.today() - timedelta(days=1))
+    trimmed = {k: v for k, v in health_data.items() if k >= yesterday}
+    if not trimmed:
+        # Just take the most recent day
+        keys = sorted(health_data.keys())[-1:]
+        trimmed = {k: health_data[k] for k in keys}
+    return trimmed
 
 
 SYSTEM_PROMPT = """You are DrWise, a personal health coach and friend.
@@ -104,18 +120,22 @@ def ask_claude(user_message, context_data=None):
 
 
 def build_daily_briefing():
+    health = truncate_health(get_recent_health(2))
+    meals = get_recent_meals(1)
     return ask_claude(
         "Give me my morning health briefing. Look at last night's sleep, yesterday's meals and activity. "
         "How recovered am I? What to focus on today? One specific nutrition tip. Punchy, not an essay.",
-        {"today_health": get_today_health(), "yesterday_meals": get_recent_meals(1), "goal": "lose weight"}
+        {"today_health": health, "yesterday_meals": meals, "goal": "lose weight"}
     )
 
 
 def build_weekly_report():
+    health = truncate_health(get_recent_health(7), max_chars=12000)
+    meals = get_recent_meals(7)
     return ask_claude(
         "Give me my weekly health report. Analyze sleep patterns, nutrition trends, activity levels, "
         "body metric changes. What went well? What needs work? 3 specific goals for next week.",
-        {"week_health": get_recent_health(7), "week_meals": get_recent_meals(7), "goal": "lose weight"}
+        {"week_health": health, "week_meals": meals, "goal": "lose weight"}
     )
 
 
@@ -129,7 +149,7 @@ def build_meal_reaction(meal):
             "today_meals_so_far": today_meals,
             "today_total_calories": sum(m.get("calories", 0) for m in today_meals),
             "today_total_protein": sum(m.get("protein", 0) for m in today_meals),
-            "today_health": get_today_health(),
+            "today_health": truncate_health(get_today_health()),
             "goal": "lose weight"
         }
     )
@@ -138,13 +158,16 @@ def build_meal_reaction(meal):
 async def start(update, context):
     uid = update.effective_user.id
     name = update.effective_user.first_name
+    # No Markdown in this message to avoid parse errors
     await update.message.reply_text(
         f"Hey {name}! 👋 I'm DrWise, your personal health coach.\n\n"
-        f"Your Telegram ID is: `{uid}`\n"
-        f"_(Add as MY\\_CHAT\\_ID in Railway Variables if not set)_\n\n"
-        f"/briefing — morning summary\n/weekly — full week report\n"
-        f"/today — today's stats\n/status — data status\n\nOr just chat! 💬",
-        parse_mode="Markdown"
+        f"Your Telegram ID is: {uid}\n"
+        f"(Add as MY_CHAT_ID in Railway Variables if not set)\n\n"
+        f"/briefing — morning summary\n"
+        f"/weekly — full week report\n"
+        f"/today — today's stats\n"
+        f"/status — data status\n\n"
+        f"Or just chat with me! 💬"
     )
 
 
@@ -161,7 +184,7 @@ async def weekly_cmd(update, context):
 async def today_cmd(update, context):
     meals = get_today_meals()
     health = get_today_health()
-    lines = ["📅 *Today so far*\n"]
+    lines = ["📅 Today so far\n"]
     if health:
         lines.append(f"📊 {len(health)} health metrics synced")
         lines.append("")
@@ -174,24 +197,26 @@ async def today_cmd(update, context):
             f"🥑 Fat: {sum(m.get('fat', 0) for m in meals):.0f}g",
         ]
     else:
-        lines.append("🍽 No meals logged yet\n_(Send a photo to FatMaster!)_")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append("🍽 No meals logged yet\n(Send a photo to FatMaster!)")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def status_cmd(update, context):
     hd = load_json(HEALTH_FILE)
     md = load_json(MEALS_FILE)
     await update.message.reply_text(
-        f"📡 *DrWise Status*\n\n"
-        f"Health data: {len(hd)} days\nLast sync: {max(hd.keys()) if hd else 'never'}\n\n"
-        f"Meal data: {len(md)} days\nLast meal: {max(md.keys()) if md else 'never'}\n\n"
-        f"{'✅ Health Auto Export connected' if hd else '⚠️ No health data yet'}",
-        parse_mode="Markdown"
+        f"📡 DrWise Status\n\n"
+        f"Health data: {len(hd)} days\n"
+        f"Last sync: {max(hd.keys()) if hd else 'never'}\n\n"
+        f"Meal data: {len(md)} days\n"
+        f"Last meal: {max(md.keys()) if md else 'never'}\n\n"
+        f"{'✅ Health Auto Export connected' if hd else '⚠️ No health data yet'}"
     )
 
 
 async def handle_text(update, context):
-    ctx = {"recent_health": get_recent_health(3), "recent_meals": get_recent_meals(3), "goal": "lose weight"}
+    health = truncate_health(get_recent_health(3))
+    ctx = {"recent_health": health, "recent_meals": get_recent_meals(3), "goal": "lose weight"}
     await update.message.reply_text(ask_claude(update.message.text, ctx))
 
 
@@ -253,8 +278,7 @@ async def send_daily_briefing(context):
     if MY_CHAT_ID:
         await context.bot.send_message(
             chat_id=int(MY_CHAT_ID),
-            text=f"☀️ *Morning Briefing*\n\n{build_daily_briefing()}",
-            parse_mode="Markdown"
+            text=f"☀️ Morning Briefing\n\n{build_daily_briefing()}"
         )
 
 
@@ -262,8 +286,7 @@ async def send_weekly_report(context):
     if MY_CHAT_ID:
         await context.bot.send_message(
             chat_id=int(MY_CHAT_ID),
-            text=f"📊 *Weekly Report*\n\n{build_weekly_report()}",
-            parse_mode="Markdown"
+            text=f"📊 Weekly Report\n\n{build_weekly_report()}"
         )
 
 
