@@ -195,20 +195,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         except:
             self.send_response(400); self.end_headers(); return
 
-        if path == "/health":
-            n = {}
-            if "sleep_analysis" in payload:
-                s = payload["sleep_analysis"]
-                n["sleep_hours"] = s.get("asleep_hours") or s.get("inBed_hours")
-            if "heart_rate_variability" in payload: n["hrv"] = payload["heart_rate_variability"].get("avg")
-            if "resting_heart_rate" in payload:     n["resting_hr"] = payload["resting_heart_rate"].get("avg")
-            if "step_count" in payload:             n["steps"] = payload["step_count"].get("sum") or payload["step_count"].get("qty")
-            if "active_energy" in payload:          n["active_calories"] = payload["active_energy"].get("sum")
-            if "body_mass" in payload:              n["weight_kg"] = payload["body_mass"].get("avg") or payload["body_mass"].get("qty")
-            if "body_fat_percentage" in payload:    n["body_fat_pct"] = payload["body_fat_percentage"].get("avg")
-            n["_raw"] = payload
-            save_health_snapshot(n)
-            logger.info(f"Health saved: {[k for k in n if k != '_raw']}")
+
+           save_health_snapshot(payload)
+        logger.info(f"Health saved — keys: {list(payload.keys())}")
 
         elif path == "/meal":
             save_meal(payload)
