@@ -48,7 +48,8 @@ def save_health_snapshot(payload):
     today = str(date.today())
     if today not in data:
         data[today] = {}
-    data[today].update(payload)
+    if isinstance(payload, dict):
+        data[today].update(payload)
     cutoff = str(date.today() - timedelta(days=90))
     save_json(HEALTH_FILE, {k: v for k, v in data.items() if k >= cutoff})
 
@@ -88,6 +89,7 @@ Talk casually, like a smart friend who knows a lot about health, nutrition, fitn
 No corporate speak, no excessive disclaimers. Be direct, warm, and practical.
 User's main goal: LOSE WEIGHT while building healthy habits.
 You have access to meal logs, sleep data, activity, heart rate, and body metrics.
+The health data may contain raw metric names from Apple Health / Oura / Withings — interpret them intelligently.
 Always personalize advice based on the actual data. Keep responses concise — this is Telegram.
 Use emojis naturally. Max 200 words unless doing a weekly report."""
 
@@ -161,18 +163,7 @@ async def today_cmd(update, context):
     health = get_today_health()
     lines = ["📅 *Today so far*\n"]
     if health:
-        for key, emoji, label in [
-            ("sleep_hours", "😴", "Sleep"), ("hrv", "💓", "HRV"),
-            ("resting_hr", "❤️", "Resting HR"), ("steps", "👟", "Steps"),
-            ("weight_kg", "⚖️", "Weight"), ("body_fat_pct", "📊", "Body fat"),
-            ("active_calories", "🔥", "Active cal"), ("exercise_minutes", "🏃", "Exercise"),
-        ]:
-            if key in health and health[key] is not None:
-                val = health[key]
-                if key == "steps":
-                    lines.append(f"{emoji} {label}: {int(float(val)):,}")
-                else:
-                    lines.append(f"{emoji} {label}: {val}")
+        lines.append(f"📊 {len(health)} health metrics synced")
         lines.append("")
     if meals:
         lines += [
@@ -233,10 +224,28 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            # Store everything raw — Claude reads all metrics directly
-            data = payload.get("data", payload)
-            save_health_snapshot(data)
-            logger.info(f"Health saved — keys: {list(data.keys())}")
+            # Log raw structure so we can debug HAE format
+            logger.info(f"HAE payload keys: {list(payload.keys())}")
+            logger.info(f"HAE payload preview: {json.dumps(payload)[:400]}")
+
+            # Handle different HAE payload formats:
+            # Format A: {"metrics": [...]}  — list of metric objects
+            # Format B: {"data": {...}}     — dict of metrics
+            # Format C: {...}               — flat dict directly
+            if "metrics" in payload and isinstance(payload["metrics"], list):
+                flat = {}
+                for m in payload["metrics"]:
+                    name = m.get("name") or m.get("metric") or m.get("type")
+                    if name:
+                        flat[name] = m
+                save_health_snapshot(flat)
+                logger.info(f"Health saved (metrics list) — {len(flat)} metrics")
+            elif "data" in payload and isinstance(payload["data"], dict):
+                save_health_snapshot(payload["data"])
+                logger.info(f"Health saved (data dict) — keys: {list(payload['data'].keys())[:10]}")
+            elif isinstance(payload, dict):
+                save_health_snapshot(payload)
+                logger.info(f"Health saved (flat) — keys: {list(payload.keys())[:10]}")
 
         elif path == "/meal":
             save_meal(payload)
