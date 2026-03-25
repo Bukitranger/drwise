@@ -234,7 +234,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
         if path == "/health":
             # Store everything raw — Claude reads all metrics directly
-            save_health_snapshot(payload)
+            save_health_snapshot(payload.get("data", payload))
             logger.info(f"Health saved — keys: {list(payload.keys())}")
 
         elif path == "/meal":
