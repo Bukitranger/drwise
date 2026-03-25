@@ -188,8 +188,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"DrWise is alive!")
 
     def do_POST(self):
-        path = self.path.split("?")[0]
-        length = int(self.headers.get("Content-Length", 0))
+        save_health_snapshot(payload)
+        logger.info(f"Health saved — keys: {list(payload.keys())}")
+        
         try:
             payload = json.loads(self.rfile.read(length))
         except:
