@@ -89,7 +89,7 @@ Talk casually, like a smart friend who knows a lot about health, nutrition, fitn
 No corporate speak, no excessive disclaimers. Be direct, warm, and practical.
 User's main goal: LOSE WEIGHT while building healthy habits.
 You have access to meal logs, sleep data, activity, heart rate, and body metrics.
-The health data may contain raw metric names from Apple Health / Oura / Withings — interpret them intelligently.
+The health data comes raw from Apple Health / Oura / Withings — interpret all fields intelligently.
 Always personalize advice based on the actual data. Keep responses concise — this is Telegram.
 Use emojis naturally. Max 200 words unless doing a weekly report."""
 
@@ -224,28 +224,9 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            # Log raw structure so we can debug HAE format
-            logger.info(f"HAE payload keys: {list(payload.keys())}")
-            logger.info(f"HAE payload preview: {json.dumps(payload)[:400]}")
-
-            # Handle different HAE payload formats:
-            # Format A: {"metrics": [...]}  — list of metric objects
-            # Format B: {"data": {...}}     — dict of metrics
-            # Format C: {...}               — flat dict directly
-            if "metrics" in payload and isinstance(payload["metrics"], list):
-                flat = {}
-                for m in payload["metrics"]:
-                    name = m.get("name") or m.get("metric") or m.get("type")
-                    if name:
-                        flat[name] = m
-                save_health_snapshot(flat)
-                logger.info(f"Health saved (metrics list) — {len(flat)} metrics")
-            elif "data" in payload and isinstance(payload["data"], dict):
-                save_health_snapshot(payload["data"])
-                logger.info(f"Health saved (data dict) — keys: {list(payload['data'].keys())[:10]}")
-            elif isinstance(payload, dict):
-                save_health_snapshot(payload)
-                logger.info(f"Health saved (flat) — keys: {list(payload.keys())[:10]}")
+            # Store everything raw — Claude reads all metrics directly
+            save_health_snapshot(payload)
+            logger.info(f"Health saved — keys: {list(payload.keys())}")
 
         elif path == "/meal":
             save_meal(payload)
