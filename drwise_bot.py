@@ -216,8 +216,15 @@ async def status_cmd(update, context):
 
 
 async def handle_text(update, context):
-    health = truncate_health(get_recent_health(3))
-    ctx = {"recent_health": health, "recent_meals": get_recent_meals(3), "goal": "lose weight"}
+    # Only pass today's health data to avoid token limits
+    today_health = get_today_health()
+    # Hard cap at 3000 chars to stay well within token limits
+    health_str = json.dumps(today_health, default=str)[:3000]
+    ctx = {
+        "today_health": health_str,
+        "recent_meals": get_recent_meals(3),
+        "goal": "lose weight"
+    }
     await update.message.reply_text(ask_claude(update.message.text, ctx))
 
 
