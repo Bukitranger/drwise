@@ -1,12 +1,15 @@
-
 """
 DrWise — Personal Health Coach Telegram Bot
+Uses Supabase for persistent storage across redeploys.
 """
 
 import os
 import json
 import logging
 import threading
+import urllib.request
+import urllib.parse
+import urllib.error
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -19,87 +22,121 @@ import anthropic
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MY_CHAT_ID = os.environ.get("MY_CHAT_ID")
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
+MY_CHAT_ID      = os.environ.get("MY_CHAT_ID")
+SUPABASE_URL    = os.environ["SUPABASE_URL"]   # https://srynunaroeufenmrwcwo.supabase.co
+SUPABASE_KEY    = os.environ["SUPABASE_KEY"]   # sb_secret_wva-...
 
+anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 message_queue: Queue = Queue()
 
-DATA_DIR = Path("data")
-DATA_DIR.mkdir(exist_ok=True)
-HEALTH_FILE = DATA_DIR / "health_data.json"
-MEALS_FILE  = DATA_DIR / "meals.json"
+
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+
+def sb(method, table, data=None, filters=None):
+    """Make a Supabase REST API request."""
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    if filters:
+        url += "?" + "&".join(f"{k}={v}" for k, v in filters.items())
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+    body = json.dumps(data, default=str).encode() if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else []
+    except urllib.error.HTTPError as e:
+        logger.error(f"Supabase {method} {table} error {e.code}: {e.read()[:200]}")
+        return None
+    except Exception as e:
+        logger.error(f"Supabase request failed: {e}")
+        return None
 
 
-def load_json(path):
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except:
-            return {}
-    return {}
-
-
-def save_json(path, data):
-    path.write_text(json.dumps(data, indent=2, default=str))
-
+# ── Health data ───────────────────────────────────────────────────────────────
 
 def save_health_snapshot(payload):
-    data = load_json(HEALTH_FILE)
+    if not isinstance(payload, dict):
+        return
     today = str(date.today())
-    if today not in data:
-        data[today] = {}
-    if isinstance(payload, dict):
-        data[today].update(payload)
-    cutoff = str(date.today() - timedelta(days=90))
-    save_json(HEALTH_FILE, {k: v for k, v in data.items() if k >= cutoff})
+    existing = sb("GET", "health_data", filters={"recorded_date": f"eq.{today}", "select": "id,data"})
+    if existing and len(existing) > 0:
+        record = existing[0]
+        merged = {**record["data"], **payload}
+        sb("PATCH", f"health_data?id=eq.{record['id']}", data={"data": merged})
+    else:
+        sb("POST", "health_data", data={"recorded_date": today, "data": payload})
 
 
 def get_recent_health(days=7):
-    data = load_json(HEALTH_FILE)
     cutoff = str(date.today() - timedelta(days=days))
-    return {k: v for k, v in data.items() if k >= cutoff}
+    records = sb("GET", "health_data", filters={
+        "recorded_date": f"gte.{cutoff}",
+        "order": "recorded_date",
+        "select": "recorded_date,data"
+    })
+    if not records:
+        return {}
+    return {r["recorded_date"]: r["data"] for r in records}
 
 
 def get_today_health():
-    return load_json(HEALTH_FILE).get(str(date.today()), {})
+    records = sb("GET", "health_data", filters={
+        "recorded_date": f"eq.{date.today()}",
+        "select": "data"
+    })
+    if records and len(records) > 0:
+        return records[0]["data"]
+    return {}
 
+
+# ── Meal data ─────────────────────────────────────────────────────────────────
 
 def save_meal(meal):
-    data = load_json(MEALS_FILE)
     today = str(date.today())
-    if today not in data:
-        data[today] = []
-    data[today].append({**meal, "time": datetime.now().isoformat()})
-    cutoff = str(date.today() - timedelta(days=90))
-    save_json(MEALS_FILE, {k: v for k, v in data.items() if k >= cutoff})
+    meal_with_time = {**meal, "time": datetime.now().isoformat()}
+    sb("POST", "meals", data={"recorded_date": today, "data": meal_with_time})
 
 
 def get_recent_meals(days=7):
-    data = load_json(MEALS_FILE)
     cutoff = str(date.today() - timedelta(days=days))
-    return {k: v for k, v in data.items() if k >= cutoff}
+    records = sb("GET", "meals", filters={
+        "recorded_date": f"gte.{cutoff}",
+        "order": "recorded_date",
+        "select": "recorded_date,data"
+    })
+    if not records:
+        return {}
+    result = {}
+    for r in records:
+        d = r["recorded_date"]
+        if d not in result:
+            result[d] = []
+        result[d].append(r["data"])
+    return result
 
 
 def get_today_meals():
-    return load_json(MEALS_FILE).get(str(date.today()), [])
+    records = sb("GET", "meals", filters={
+        "recorded_date": f"eq.{date.today()}",
+        "order": "created_at",
+        "select": "data"
+    })
+    if not records:
+        return []
+    return [r["data"] for r in records]
 
 
-def truncate_health(health_data, max_chars=8000):
-    """Truncate health data to avoid hitting Claude's token limit."""
-    raw = json.dumps(health_data, default=str)
-    if len(raw) <= max_chars:
-        return health_data
-    # Too large — summarize by keeping only today + yesterday
-    today = str(date.today())
-    yesterday = str(date.today() - timedelta(days=1))
-    trimmed = {k: v for k, v in health_data.items() if k >= yesterday}
-    if not trimmed:
-        # Just take the most recent day
-        keys = sorted(health_data.keys())[-1:]
-        trimmed = {k: health_data[k] for k in keys}
-    return trimmed
-
+# ── Claude AI ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are DrWise, a personal health coach and friend.
 Talk casually, like a smart friend who knows a lot about health, nutrition, fitness and recovery.
@@ -114,11 +151,18 @@ IMPORTANT USER PREFERENCES — always follow these:
 - All weight data is in KILOGRAMS (kg). Always display weight in kg, never lbs.
 - All distances are in KILOMETERS (km), never miles.
 - User is based in Tokyo, Japan. Times are JST (UTC+9).
-- Weight data comes from a Withings scale. Sleep and recovery from Oura Ring."""
+- Weight and body composition data comes from a Withings scale.
+- Sleep and recovery scores come from an Oura Ring."""
 
 
 def ask_claude(user_message, context_data=None):
-    context = f"\n\nUser's health data:\n{json.dumps(context_data, indent=2, default=str)}" if context_data else ""
+    context = ""
+    if context_data:
+        raw = json.dumps(context_data, default=str)
+        # Hard cap at 6000 chars to stay within token limits
+        if len(raw) > 6000:
+            raw = raw[:6000] + "... [truncated]"
+        context = f"\n\nUser's health data:\n{raw}"
     response = anthropic_client.messages.create(
         model="claude-opus-4-5", max_tokens=1000, system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message + context}]
@@ -127,22 +171,18 @@ def ask_claude(user_message, context_data=None):
 
 
 def build_daily_briefing():
-    health = truncate_health(get_recent_health(2))
-    meals = get_recent_meals(1)
     return ask_claude(
         "Give me my morning health briefing. Look at last night's sleep, yesterday's meals and activity. "
         "How recovered am I? What to focus on today? One specific nutrition tip. Punchy, not an essay.",
-        {"today_health": health, "yesterday_meals": meals, "goal": "lose weight"}
+        {"today_health": get_today_health(), "yesterday_meals": get_recent_meals(1), "goal": "lose weight"}
     )
 
 
 def build_weekly_report():
-    health = truncate_health(get_recent_health(7), max_chars=12000)
-    meals = get_recent_meals(7)
     return ask_claude(
         "Give me my weekly health report. Analyze sleep patterns, nutrition trends, activity levels, "
         "body metric changes. What went well? What needs work? 3 specific goals for next week.",
-        {"week_health": health, "week_meals": meals, "goal": "lose weight"}
+        {"week_health": get_recent_health(7), "week_meals": get_recent_meals(7), "goal": "lose weight"}
     )
 
 
@@ -156,16 +196,17 @@ def build_meal_reaction(meal):
             "today_meals_so_far": today_meals,
             "today_total_calories": sum(m.get("calories", 0) for m in today_meals),
             "today_total_protein": sum(m.get("protein", 0) for m in today_meals),
-            "today_health": truncate_health(get_today_health()),
+            "today_health": get_today_health(),
             "goal": "lose weight"
         }
     )
 
 
+# ── Telegram handlers ─────────────────────────────────────────────────────────
+
 async def start(update, context):
     uid = update.effective_user.id
     name = update.effective_user.first_name
-    # No Markdown in this message to avoid parse errors
     await update.message.reply_text(
         f"Hey {name}! 👋 I'm DrWise, your personal health coach.\n\n"
         f"Your Telegram ID is: {uid}\n"
@@ -209,23 +250,23 @@ async def today_cmd(update, context):
 
 
 async def status_cmd(update, context):
-    hd = load_json(HEALTH_FILE)
-    md = load_json(MEALS_FILE)
+    health = get_recent_health(90)
+    meals = get_recent_meals(90)
+    last_health = max(health.keys()) if health else "never"
+    last_meal = max(meals.keys()) if meals else "never"
     await update.message.reply_text(
         f"📡 DrWise Status\n\n"
-        f"Health data: {len(hd)} days\n"
-        f"Last sync: {max(hd.keys()) if hd else 'never'}\n\n"
-        f"Meal data: {len(md)} days\n"
-        f"Last meal: {max(md.keys()) if md else 'never'}\n\n"
-        f"{'✅ Health Auto Export connected' if hd else '⚠️ No health data yet'}"
+        f"Health data: {len(health)} days stored\n"
+        f"Last sync: {last_health}\n\n"
+        f"Meal data: {len(meals)} days stored\n"
+        f"Last meal: {last_meal}\n\n"
+        f"Storage: Supabase ✅ (persistent)"
     )
 
 
 async def handle_text(update, context):
-    # Only pass today's health data to avoid token limits
     today_health = get_today_health()
-    # Hard cap at 3000 chars to stay well within token limits
-    health_str = json.dumps(today_health, default=str)[:3000]
+    health_str = json.dumps(today_health, default=str)[:4000]
     ctx = {
         "today_health": health_str,
         "recent_meals": get_recent_meals(3),
@@ -242,6 +283,8 @@ async def drain_message_queue(context):
         except Exception as e:
             logger.error(f"Queue drain error: {e}")
 
+
+# ── Webhook server ────────────────────────────────────────────────────────────
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -263,7 +306,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/health":
-            # Store everything raw — Claude reads all metrics directly
             save_health_snapshot(payload)
             logger.info(f"Health saved — keys: {list(payload.keys())}")
 
@@ -288,6 +330,8 @@ def run_webhook_server():
     HTTPServer(("0.0.0.0", port), WebhookHandler).serve_forever()
 
 
+# ── Scheduled jobs ────────────────────────────────────────────────────────────
+
 async def send_daily_briefing(context):
     if MY_CHAT_ID:
         await context.bot.send_message(
@@ -303,6 +347,8 @@ async def send_weekly_report(context):
             text=f"📊 Weekly Report\n\n{build_weekly_report()}"
         )
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     threading.Thread(target=run_webhook_server, daemon=True).start()
