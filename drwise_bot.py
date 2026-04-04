@@ -1,19 +1,19 @@
 """
 DrWise — Personal Health Coach Telegram Bot
-Uses Supabase for persistent storage across redeploys.
+Reads health data from Supabase (written by HAE via Edge Function).
+Meals stored in Supabase via FatMaster.
+No webhook server needed — pure Telegram bot.
 """
 
 import os
 import json
 import logging
 import threading
-import urllib.request
-import urllib.parse
-import urllib.error
 from datetime import datetime, date, timedelta
-from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from queue import Queue
+import urllib.request
+import urllib.error
 
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -22,34 +22,30 @@ import anthropic
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
-ANTHROPIC_KEY   = os.environ["ANTHROPIC_API_KEY"]
-MY_CHAT_ID      = os.environ.get("MY_CHAT_ID")
-SUPABASE_URL    = os.environ["SUPABASE_URL"]   # https://srynunaroeufenmrwcwo.supabase.co
-SUPABASE_KEY    = os.environ["SUPABASE_KEY"]   # sb_secret_wva-...
+TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+ANTHROPIC_KEY  = os.environ["ANTHROPIC_API_KEY"]
+MY_CHAT_ID     = os.environ.get("MY_CHAT_ID")
+SUPABASE_URL   = os.environ["SUPABASE_URL"]
+SUPABASE_KEY   = os.environ["SUPABASE_KEY"]
 
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
 message_queue: Queue = Queue()
 
 
-# ── Supabase helpers ──────────────────────────────────────────────────────────
+# ── Supabase ──────────────────────────────────────────────────────────────────
 
 def sb(method, table, data=None, filters=None):
-    """Make a Supabase REST API request."""
     url = f"{SUPABASE_URL}/rest/v1/{table}"
     if filters:
         url += "?" + "&".join(f"{k}={v}" for k, v in filters.items())
-
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
-
     body = json.dumps(data, default=str).encode() if data else None
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
-
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             raw = resp.read()
@@ -60,21 +56,6 @@ def sb(method, table, data=None, filters=None):
     except Exception as e:
         logger.error(f"Supabase request failed: {e}")
         return None
-
-
-# ── Health data ───────────────────────────────────────────────────────────────
-
-def save_health_snapshot(payload):
-    if not isinstance(payload, dict):
-        return
-    today = str(date.today())
-    existing = sb("GET", "health_data", filters={"recorded_date": f"eq.{today}", "select": "id,data"})
-    if existing and len(existing) > 0:
-        record = existing[0]
-        merged = {**record["data"], **payload}
-        sb("PATCH", f"health_data?id=eq.{record['id']}", data={"data": merged})
-    else:
-        sb("POST", "health_data", data={"recorded_date": today, "data": payload})
 
 
 def get_recent_health(days=7):
@@ -98,8 +79,6 @@ def get_today_health():
         return records[0]["data"]
     return {}
 
-
-# ── Meal data ─────────────────────────────────────────────────────────────────
 
 def save_meal(meal):
     today = str(date.today())
@@ -131,9 +110,7 @@ def get_today_meals():
         "order": "created_at",
         "select": "data"
     })
-    if not records:
-        return []
-    return [r["data"] for r in records]
+    return [r["data"] for r in records] if records else []
 
 
 # ── Claude AI ─────────────────────────────────────────────────────────────────
@@ -143,23 +120,24 @@ Talk casually, like a smart friend who knows a lot about health, nutrition, fitn
 No corporate speak, no excessive disclaimers. Be direct, warm, and practical.
 User's main goal: LOSE WEIGHT while building healthy habits.
 You have access to meal logs, sleep data, activity, heart rate, and body metrics.
-The health data comes raw from Apple Health / Oura / Withings — interpret all fields intelligently.
+The health data comes from Apple Health / Oura / Withings via Health Auto Export.
+Metric names follow Apple Health conventions e.g. weight_body_mass, body_fat_percentage, sleep_analysis, heart_rate, step_count.
+Each metric has a 'data' array of readings and a 'units' field.
 Always personalize advice based on the actual data. Keep responses concise — this is Telegram.
 Use emojis naturally. Max 200 words unless doing a weekly report.
 
-IMPORTANT USER PREFERENCES — always follow these:
-- All weight data is in KILOGRAMS (kg). Always display weight in kg, never lbs.
-- All distances are in KILOMETERS (km), never miles.
-- User is based in Tokyo, Japan. Times are JST (UTC+9).
-- Weight and body composition data comes from a Withings scale.
-- Sleep and recovery scores come from an Oura Ring."""
+IMPORTANT USER PREFERENCES:
+- All weight is in KILOGRAMS (kg). Never use lbs.
+- Distances in KILOMETERS (km). Never miles.
+- User is in Tokyo, Japan (JST = UTC+9).
+- Weight and body composition from Withings scale.
+- Sleep and recovery from Oura Ring."""
 
 
 def ask_claude(user_message, context_data=None):
     context = ""
     if context_data:
         raw = json.dumps(context_data, default=str)
-        # Hard cap at 6000 chars to stay within token limits
         if len(raw) > 6000:
             raw = raw[:6000] + "... [truncated]"
         context = f"\n\nUser's health data:\n{raw}"
@@ -209,8 +187,7 @@ async def start(update, context):
     name = update.effective_user.first_name
     await update.message.reply_text(
         f"Hey {name}! 👋 I'm DrWise, your personal health coach.\n\n"
-        f"Your Telegram ID is: {uid}\n"
-        f"(Add as MY_CHAT_ID in Railway Variables if not set)\n\n"
+        f"Your Telegram ID is: {uid}\n\n"
         f"/briefing — morning summary\n"
         f"/weekly — full week report\n"
         f"/today — today's stats\n"
@@ -234,7 +211,7 @@ async def today_cmd(update, context):
     health = get_today_health()
     lines = ["📅 Today so far\n"]
     if health:
-        lines.append(f"📊 {len(health)} health metrics synced")
+        lines.append(f"📊 {len(health)} health metrics synced from Apple Health")
         lines.append("")
     if meals:
         lines += [
@@ -256,11 +233,11 @@ async def status_cmd(update, context):
     last_meal = max(meals.keys()) if meals else "never"
     await update.message.reply_text(
         f"📡 DrWise Status\n\n"
-        f"Health data: {len(health)} days stored\n"
+        f"Health data: {len(health)} days in Supabase\n"
         f"Last sync: {last_health}\n\n"
-        f"Meal data: {len(meals)} days stored\n"
+        f"Meal data: {len(meals)} days in Supabase\n"
         f"Last meal: {last_meal}\n\n"
-        f"Storage: Supabase ✅ (persistent)"
+        f"Storage: Supabase ✅ (persistent, never resets)"
     )
 
 
@@ -284,7 +261,7 @@ async def drain_message_queue(context):
             logger.error(f"Queue drain error: {e}")
 
 
-# ── Webhook server ────────────────────────────────────────────────────────────
+# ── Meal webhook (from FatMaster) ─────────────────────────────────────────────
 
 class WebhookHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -305,11 +282,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        if path == "/health":
-            save_health_snapshot(payload)
-            logger.info(f"Health saved — keys: {list(payload.keys())}")
-
-        elif path == "/meal":
+        if path == "/meal":
             save_meal(payload)
             logger.info(f"Meal from FatMaster: {payload.get('meal', '?')}")
             if MY_CHAT_ID:
