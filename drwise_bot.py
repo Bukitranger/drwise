@@ -108,7 +108,13 @@ User's main goal: LOSE WEIGHT while building healthy habits.
 You have access to meal logs, sleep data, activity, heart rate, and body metrics.
 The health data comes raw from Apple Health / Oura / Withings — interpret all fields intelligently.
 Always personalize advice based on the actual data. Keep responses concise — this is Telegram.
-Use emojis naturally. Max 200 words unless doing a weekly report."""
+Use emojis naturally. Max 200 words unless doing a weekly report.
+
+IMPORTANT USER PREFERENCES — always follow these:
+- All weight data is in KILOGRAMS (kg). Always display weight in kg, never lbs.
+- All distances are in KILOMETERS (km), never miles.
+- User is based in Tokyo, Japan. Times are JST (UTC+9).
+- Weight data comes from a Withings scale. Sleep and recovery from Oura Ring."""
 
 
 def ask_claude(user_message, context_data=None):
