@@ -333,12 +333,12 @@ async def status_cmd(update, context):
         f"Storage: Supabase ✅ (persistent)"
     )
 
-
 async def handle_text(update, context):
-    today_summary = summarize_health(get_today_health_raw())
+    records = get_health_records(30)
+    week_summary = summarize_health_week(records)
     ctx = {
-        "today_health": today_summary,
-        "recent_meals": get_recent_meals(3),
+        "week_health": week_summary,
+        "recent_meals": get_recent_meals(7),
         "goal": "lose weight"
     }
     await update.message.reply_text(ask_claude(update.message.text, ctx))
