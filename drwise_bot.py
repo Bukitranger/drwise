@@ -161,6 +161,11 @@ def extract_latest_value(metric_data):
     return None
 
 
+# Metrics Apple Health stores in lbs — convert to kg
+LBS_TO_KG = {"Weight", "Lean Mass"}
+# Metrics stored in meters — convert to cm
+M_TO_CM = {"Step Length"}
+
 def summarize_health(raw: dict) -> dict:
     """Convert raw HAE metric dict into clean summary dict."""
     summary = {}
@@ -170,6 +175,10 @@ def summarize_health(raw: dict) -> dict:
             if val is not None:
                 try:
                     val = round(float(val), 2)
+                    if label in LBS_TO_KG:
+                        val = round(val * 0.453592, 1)
+                    elif label in M_TO_CM:
+                        val = round(val * 100, 1)
                     summary[label] = f"{val} {unit}".strip()
                 except:
                     summary[label] = str(val)
