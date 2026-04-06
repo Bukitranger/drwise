@@ -173,16 +173,40 @@ LBS_TO_KG = {"Weight", "Lean Mass"}
 M_TO_CM = {"Step Length"}
 
 
-def extract_summary_value(metric_data):
+def extract_summary_value(metric_data, label):
+    """Extract a smart summary — sum for counts, latest for body metrics, avg for rates."""
     if not isinstance(metric_data, dict):
         return None
     data_arr = metric_data.get("data", [])
     if not data_arr or not isinstance(data_arr, list):
         return None
-    last = data_arr[-1]
-    if isinstance(last, dict):
-        return last.get("qty") or last.get("value") or last.get("inBed") or last.get("asleep")
-    return None
+
+    SUM_METRICS = {"Steps", "Active Calories", "Basal Calories", "Exercise Time",
+                   "Stand Time", "Flights Climbed", "Distance", "Daylight Time"}
+    LATEST_METRICS = {"Weight", "BMI", "Body Fat", "Lean Mass", "Height",
+                      "VO2 Max", "Walking Steadiness"}
+
+    values = []
+    for entry in data_arr:
+        if not isinstance(entry, dict):
+            continue
+        val = (entry.get("qty") or entry.get("Avg") or entry.get("value")
+               or entry.get("inBed") or entry.get("asleep"))
+        if val is not None:
+            try:
+                values.append(float(val))
+            except:
+                pass
+
+    if not values:
+        return None
+
+    if label in SUM_METRICS:
+        return round(sum(values), 1)
+    elif label in LATEST_METRICS:
+        return round(values[-1], 2)
+    else:
+        return round(sum(values) / len(values), 1)
 
 
 def summarize_health(raw: dict) -> dict:
