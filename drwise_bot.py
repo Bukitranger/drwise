@@ -375,7 +375,6 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/meal":
-            save_meal(payload)
             logger.info(f"Meal from FatMaster: {payload.get('meal', '?')}")
             if MY_CHAT_ID:
                 try:
