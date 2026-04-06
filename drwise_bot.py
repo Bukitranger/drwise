@@ -3,6 +3,7 @@ DrWise — Personal Health Coach Telegram Bot
 - Reads health data from Supabase (written by HAE via Edge Function)
 - Reads meals from Supabase (written by FatMaster)
 - Persistent user profile memory via /remember command
+- Smart health metric aggregation (sum/avg/latest per metric type)
 """
 
 import os
@@ -61,18 +62,13 @@ def sb(method, table, data=None, filters=None):
 # ── User profile (persistent memory) ─────────────────────────────────────────
 
 def get_user_profile() -> str:
-    """Load all user profile notes as a formatted string."""
     records = sb("GET", "user_profile", filters={"select": "key,value", "order": "updated_at"})
     if not records:
         return ""
-    lines = []
-    for r in records:
-        lines.append(f"- {r['key']}: {r['value']}")
-    return "\n".join(lines)
+    return "\n".join(f"- {r['key']}: {r['value']}" for r in records)
 
 
 def save_profile_note(key: str, value: str):
-    """Save or update a profile note."""
     existing = sb("GET", "user_profile", filters={"key": f"eq.{key}", "select": "id"})
     if existing and len(existing) > 0:
         sb("PATCH", f"user_profile?key=eq.{key}", data={"value": value, "updated_at": datetime.now().isoformat()})
@@ -171,20 +167,18 @@ METRIC_MAP = {
 
 LBS_TO_KG = {"Weight", "Lean Mass"}
 M_TO_CM = {"Step Length"}
+SUM_METRICS = {"Steps", "Active Calories", "Basal Calories", "Exercise Time",
+               "Stand Time", "Flights Climbed", "Distance", "Daylight Time"}
+LATEST_METRICS = {"Weight", "BMI", "Body Fat", "Lean Mass", "VO2 Max", "Walking Steadiness"}
 
 
 def extract_summary_value(metric_data, label):
-    """Extract a smart summary — sum for counts, latest for body metrics, avg for rates."""
+    """Smart aggregation: sum for activity, latest for body metrics, avg for rates."""
     if not isinstance(metric_data, dict):
         return None
     data_arr = metric_data.get("data", [])
     if not data_arr or not isinstance(data_arr, list):
         return None
-
-    SUM_METRICS = {"Steps", "Active Calories", "Basal Calories", "Exercise Time",
-                   "Stand Time", "Flights Climbed", "Distance", "Daylight Time"}
-    LATEST_METRICS = {"Weight", "BMI", "Body Fat", "Lean Mass", "Height",
-                      "VO2 Max", "Walking Steadiness"}
 
     values = []
     for entry in data_arr:
@@ -255,7 +249,6 @@ IMPORTANT USER PREFERENCES:
 
 
 def get_system_prompt() -> str:
-    """Build system prompt with persistent user profile injected."""
     profile = get_user_profile()
     if profile:
         return BASE_SYSTEM_PROMPT + f"\n\nPERSONAL NOTES ABOUT THIS USER (always respect these):\n{profile}"
@@ -265,10 +258,7 @@ def get_system_prompt() -> str:
 def ask_claude(user_message, context_data=None):
     context = ""
     if context_data:
-        raw = json.dumps(context_data, default=str)
-        if len(raw) > 8000:
-            raw = raw[:8000] + "... [truncated]"
-        context = f"\n\nUser's health data:\n{raw}"
+        context = f"\n\nUser's health data:\n{json.dumps(context_data, default=str)}"
     response = anthropic_client.messages.create(
         model="claude-opus-4-5", max_tokens=1000,
         system=get_system_prompt(),
@@ -281,10 +271,12 @@ def build_daily_briefing():
     records = get_health_records(2)
     health_summary = summarize_health_week(records)
     meals = get_recent_meals(1)
+    health_str = json.dumps(health_summary, default=str)[:4000]
+    meals_str = json.dumps(meals, default=str)[:2000]
     return ask_claude(
         "Give me my morning health briefing. Look at my recent health metrics and yesterday's meals. "
         "How recovered am I? What to focus on today? One specific nutrition tip. Punchy, not an essay.",
-        {"health": health_summary, "yesterday_meals": meals, "goal": "lose weight"}
+        {"health": health_str, "yesterday_meals": meals_str, "goal": "lose weight"}
     )
 
 
@@ -292,11 +284,13 @@ def build_weekly_report():
     records = get_health_records(30)
     health_summary = summarize_health_week(records)
     meals = get_recent_meals(30)
+    health_str = json.dumps(health_summary, default=str)[:5000]
+    meals_str = json.dumps(meals, default=str)[:3000]
     return ask_claude(
         "Give me my monthly health report. Analyze sleep patterns, nutrition trends, activity levels, "
         "body metric changes over the past 30 days. What are the key trends? What needs work? "
         "3 specific goals for the coming weeks.",
-        {"month_health": health_summary, "month_meals": meals, "goal": "lose weight"}
+        {"month_health": health_str, "month_meals": meals_str, "goal": "lose weight"}
     )
 
 
@@ -388,7 +382,6 @@ async def status_cmd(update, context):
 
 
 async def remember_cmd(update, context):
-    """Save a note to user profile. Usage: /remember I had knee surgery in March 2026"""
     text = " ".join(context.args)
     if not text:
         await update.message.reply_text(
@@ -396,14 +389,12 @@ async def remember_cmd(update, context):
             "Example: /remember I had surgery and can't do high step counts yet"
         )
         return
-    # Use timestamp as key for general notes
     key = f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     save_profile_note(key, text)
     await update.message.reply_text(f"✅ Got it, I'll remember that:\n\"{text}\"")
 
 
 async def memories_cmd(update, context):
-    """Show all saved memories."""
     records = sb("GET", "user_profile", filters={"select": "key,value,updated_at", "order": "updated_at"})
     if not records:
         await update.message.reply_text("No memories saved yet.\nUse /remember to add notes!")
@@ -415,7 +406,6 @@ async def memories_cmd(update, context):
 
 
 async def forget_cmd(update, context):
-    """Delete a memory by key. Usage: /forget note_20260405_123456"""
     if not context.args:
         await update.message.reply_text("Usage: /forget [key]\nUse /memories to see keys.")
         return
@@ -427,9 +417,19 @@ async def forget_cmd(update, context):
 async def handle_text(update, context):
     records = get_health_records(30)
     health_summary = summarize_health_week(records)
+    meals = get_recent_meals(7)
+
+    health_str = json.dumps(health_summary, default=str)
+    if len(health_str) > 5000:
+        health_str = health_str[:5000] + "... [truncated]"
+
+    meals_str = json.dumps(meals, default=str)
+    if len(meals_str) > 3000:
+        meals_str = meals_str[:3000] + "... [truncated]"
+
     ctx = {
-        "health_last_30_days": health_summary,
-        "recent_meals": get_recent_meals(7),
+        "health_last_30_days": health_str,
+        "recent_meals": meals_str,
         "goal": "lose weight"
     }
     await update.message.reply_text(ask_claude(update.message.text, ctx))
