@@ -417,19 +417,21 @@ async def forget_cmd(update, context):
 async def handle_text(update, context):
     records = get_health_records(30)
     health_summary = summarize_health_week(records)
-    meals = get_recent_meals(7)
+    today_meals = get_today_meals()
+    recent_meals = get_recent_meals(7)
 
     health_str = json.dumps(health_summary, default=str)
-    if len(health_str) > 5000:
-        health_str = health_str[:5000] + "... [truncated]"
+    if len(health_str) > 4000:
+        health_str = health_str[:4000] + "... [truncated]"
 
-    meals_str = json.dumps(meals, default=str)
-    if len(meals_str) > 3000:
-        meals_str = meals_str[:3000] + "... [truncated]"
+    recent_meals_str = json.dumps(recent_meals, default=str)
+    if len(recent_meals_str) > 2000:
+        recent_meals_str = recent_meals_str[:2000] + "... [truncated]"
 
     ctx = {
         "health_last_30_days": health_str,
-        "recent_meals": meals_str,
+        "todays_meals": today_meals,  # always full, never truncated
+        "recent_meals_history": recent_meals_str,
         "goal": "lose weight"
     }
     await update.message.reply_text(ask_claude(update.message.text, ctx))
