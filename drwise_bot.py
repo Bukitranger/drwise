@@ -1,6 +1,8 @@
 """
 DrWise — Personal Health Coach Telegram Bot
-Reads health data from Supabase (written by HAE via Edge Function).
+- Reads health data from Supabase (written by HAE via Edge Function)
+- Reads meals from Supabase (written by FatMaster)
+- Persistent user profile memory via /remember command
 """
 
 import os
@@ -56,7 +58,35 @@ def sb(method, table, data=None, filters=None):
         return None
 
 
-def get_health_records(days=7):
+# ── User profile (persistent memory) ─────────────────────────────────────────
+
+def get_user_profile() -> str:
+    """Load all user profile notes as a formatted string."""
+    records = sb("GET", "user_profile", filters={"select": "key,value", "order": "updated_at"})
+    if not records:
+        return ""
+    lines = []
+    for r in records:
+        lines.append(f"- {r['key']}: {r['value']}")
+    return "\n".join(lines)
+
+
+def save_profile_note(key: str, value: str):
+    """Save or update a profile note."""
+    existing = sb("GET", "user_profile", filters={"key": f"eq.{key}", "select": "id"})
+    if existing and len(existing) > 0:
+        sb("PATCH", f"user_profile?key=eq.{key}", data={"value": value, "updated_at": datetime.now().isoformat()})
+    else:
+        sb("POST", "user_profile", data={"key": key, "value": value})
+
+
+def delete_profile_note(key: str):
+    sb("DELETE", f"user_profile?key=eq.{key}", filters=None)
+
+
+# ── Health data ───────────────────────────────────────────────────────────────
+
+def get_health_records(days=30):
     cutoff = str(date.today() - timedelta(days=days))
     records = sb("GET", "health_data", filters={
         "recorded_date": f"gte.{cutoff}",
@@ -76,11 +106,7 @@ def get_today_health_raw():
     return {}
 
 
-def save_meal(meal):
-    today = str(date.today())
-    meal_with_time = {**meal, "time": datetime.now().isoformat()}
-    sb("POST", "meals", data={"recorded_date": today, "data": meal_with_time})
-
+# ── Meal data ─────────────────────────────────────────────────────────────────
 
 def get_recent_meals(days=7):
     cutoff = str(date.today() - timedelta(days=days))
@@ -110,64 +136,56 @@ def get_today_meals():
 
 
 # ── Health summarizer ─────────────────────────────────────────────────────────
-# Extracts clean latest values from HAE's nested metric structure
-# HAE format: { "metric_name": { "units": "kg", "data": [{"qty": 82.1, "date": "..."}, ...] } }
 
-# Map HAE metric names → friendly labels and units
 METRIC_MAP = {
-    "heart_rate":                    ("Heart Rate", "bpm"),
-    "resting_heart_rate":            ("Resting HR", "bpm"),
-    "heart_rate_variability_sdnn":   ("HRV", "ms"),
-    "walking_heart_rate_average":    ("Walking HR avg", "bpm"),
-    "heart_rate_recovery_one_minute":("HR Recovery", "bpm"),
-    "step_count":                    ("Steps", "steps"),
-    "distance_walking_running":      ("Distance", "km"),
-    "active_energy_burned":          ("Active Calories", "kcal"),
-    "basal_energy_burned":           ("Basal Calories", "kcal"),
-    "apple_exercise_time":           ("Exercise Time", "min"),
-    "apple_stand_time":              ("Stand Time", "min"),
-    "flights_climbed":               ("Flights Climbed", "floors"),
-    "vo2_max":                       ("VO2 Max", "ml/kg/min"),
-    "weight_body_mass":              ("Weight", "kg"),
-    "body_mass_index":               ("BMI", ""),
-    "body_fat_percentage":           ("Body Fat", "%"),
-    "lean_body_mass":                ("Lean Mass", "kg"),
-    "sleep_analysis":                ("Sleep", "hr"),
-    "respiratory_rate":              ("Respiratory Rate", "breaths/min"),
-    "oxygen_saturation":             ("Blood Oxygen", "%"),
-    "walking_speed":                 ("Walking Speed", "km/h"),
-    "walking_step_length":           ("Step Length", "cm"),
-    "walking_asymmetry_percentage":  ("Walking Asymmetry", "%"),
-    "walking_double_support_percentage": ("Double Support", "%"),
-    "apple_walking_steadiness":      ("Walking Steadiness", "%"),
-    "time_in_daylight":              ("Daylight Time", "min"),
-    "physical_effort":               ("Physical Effort", "MET"),
-    "environmental_audio_exposure":  ("Env Audio", "dB"),
-    "headphone_audio_exposure":      ("Headphone Audio", "dB"),
+    "heart_rate":                       ("Heart Rate", "bpm"),
+    "resting_heart_rate":               ("Resting HR", "bpm"),
+    "heart_rate_variability_sdnn":      ("HRV", "ms"),
+    "walking_heart_rate_average":       ("Walking HR avg", "bpm"),
+    "heart_rate_recovery_one_minute":   ("HR Recovery", "bpm"),
+    "step_count":                       ("Steps", "steps"),
+    "walking_running_distance":         ("Distance", "km"),
+    "active_energy_burned":             ("Active Calories", "kcal"),
+    "basal_energy_burned":              ("Basal Calories", "kcal"),
+    "apple_exercise_time":              ("Exercise Time", "min"),
+    "apple_stand_time":                 ("Stand Time", "min"),
+    "flights_climbed":                  ("Flights Climbed", "floors"),
+    "vo2_max":                          ("VO2 Max", "ml/kg/min"),
+    "weight_body_mass":                 ("Weight", "kg"),
+    "body_mass_index":                  ("BMI", ""),
+    "body_fat_percentage":              ("Body Fat", "%"),
+    "lean_body_mass":                   ("Lean Mass", "kg"),
+    "sleep_analysis":                   ("Sleep", "hr"),
+    "respiratory_rate":                 ("Respiratory Rate", "breaths/min"),
+    "oxygen_saturation":                ("Blood Oxygen", "%"),
+    "walking_speed":                    ("Walking Speed", "km/h"),
+    "walking_step_length":              ("Step Length", "cm"),
+    "walking_asymmetry_percentage":     ("Walking Asymmetry", "%"),
+    "walking_double_support_percentage":("Double Support", "%"),
+    "apple_walking_steadiness":         ("Walking Steadiness", "%"),
+    "time_in_daylight":                 ("Daylight Time", "min"),
+    "physical_effort":                  ("Physical Effort", "MET"),
+    "environmental_audio_exposure":     ("Env Audio", "dB"),
+    "headphone_audio_exposure":         ("Headphone Audio", "dB"),
 }
+
+LBS_TO_KG = {"Weight", "Lean Mass"}
+M_TO_CM = {"Step Length"}
 
 
 def extract_latest_value(metric_data):
-    """Get the most recent value from a HAE metric object."""
     if not isinstance(metric_data, dict):
         return None
     data_arr = metric_data.get("data", [])
     if not data_arr or not isinstance(data_arr, list):
         return None
-    # Get last entry
     last = data_arr[-1]
     if isinstance(last, dict):
         return last.get("qty") or last.get("value") or last.get("inBed") or last.get("asleep")
     return None
 
 
-# Metrics Apple Health stores in lbs — convert to kg
-LBS_TO_KG = {"Weight", "Lean Mass"}
-# Metrics stored in meters — convert to cm
-M_TO_CM = {"Step Length"}
-
 def summarize_health(raw: dict) -> dict:
-    """Convert raw HAE metric dict into clean summary dict."""
     summary = {}
     for key, (label, unit) in METRIC_MAP.items():
         if key in raw:
@@ -186,7 +204,6 @@ def summarize_health(raw: dict) -> dict:
 
 
 def summarize_health_week(records) -> dict:
-    """Summarize a week of health records into daily snapshots."""
     result = {}
     for r in records:
         day = r["recorded_date"]
@@ -197,7 +214,7 @@ def summarize_health_week(records) -> dict:
 
 # ── Claude AI ─────────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are DrWise, a personal health coach and friend.
+BASE_SYSTEM_PROMPT = """You are DrWise, a personal health coach and friend.
 Talk casually, like a smart friend who knows a lot about health, nutrition, fitness and recovery.
 No corporate speak, no excessive disclaimers. Be direct, warm, and practical.
 User's main goal: LOSE WEIGHT while building healthy habits.
@@ -213,39 +230,49 @@ IMPORTANT USER PREFERENCES:
 - Sleep and recovery from Oura Ring."""
 
 
+def get_system_prompt() -> str:
+    """Build system prompt with persistent user profile injected."""
+    profile = get_user_profile()
+    if profile:
+        return BASE_SYSTEM_PROMPT + f"\n\nPERSONAL NOTES ABOUT THIS USER (always respect these):\n{profile}"
+    return BASE_SYSTEM_PROMPT
+
+
 def ask_claude(user_message, context_data=None):
     context = ""
     if context_data:
         raw = json.dumps(context_data, default=str)
-        if len(raw) > 6000:
-            raw = raw[:6000] + "... [truncated]"
+        if len(raw) > 8000:
+            raw = raw[:8000] + "... [truncated]"
         context = f"\n\nUser's health data:\n{raw}"
     response = anthropic_client.messages.create(
-        model="claude-opus-4-5", max_tokens=1000, system=SYSTEM_PROMPT,
+        model="claude-opus-4-5", max_tokens=1000,
+        system=get_system_prompt(),
         messages=[{"role": "user", "content": user_message + context}]
     )
     return response.content[0].text
 
 
 def build_daily_briefing():
-    today_raw = get_today_health_raw()
-    today_summary = summarize_health(today_raw)
+    records = get_health_records(2)
+    health_summary = summarize_health_week(records)
     meals = get_recent_meals(1)
     return ask_claude(
-        "Give me my morning health briefing. Look at my health metrics and yesterday's meals. "
+        "Give me my morning health briefing. Look at my recent health metrics and yesterday's meals. "
         "How recovered am I? What to focus on today? One specific nutrition tip. Punchy, not an essay.",
-        {"today_health": today_summary, "yesterday_meals": meals, "goal": "lose weight"}
+        {"health": health_summary, "yesterday_meals": meals, "goal": "lose weight"}
     )
 
 
 def build_weekly_report():
-    records = get_health_records(7)
-    week_summary = summarize_health_week(records)
-    meals = get_recent_meals(7)
+    records = get_health_records(30)
+    health_summary = summarize_health_week(records)
+    meals = get_recent_meals(30)
     return ask_claude(
-        "Give me my weekly health report. Analyze sleep patterns, nutrition trends, activity levels, "
-        "body metric changes. What went well? What needs work? 3 specific goals for next week.",
-        {"week_health": week_summary, "week_meals": meals, "goal": "lose weight"}
+        "Give me my monthly health report. Analyze sleep patterns, nutrition trends, activity levels, "
+        "body metric changes over the past 30 days. What are the key trends? What needs work? "
+        "3 specific goals for the coming weeks.",
+        {"month_health": health_summary, "month_meals": meals, "goal": "lose weight"}
     )
 
 
@@ -275,9 +302,12 @@ async def start(update, context):
         f"Hey {name}! 👋 I'm DrWise, your personal health coach.\n\n"
         f"Your Telegram ID is: {uid}\n\n"
         f"/briefing — morning summary\n"
-        f"/weekly — full week report\n"
+        f"/weekly — monthly report\n"
         f"/today — today's stats\n"
-        f"/status — data status\n\n"
+        f"/status — data status\n"
+        f"/remember [note] — save something important\n"
+        f"/memories — see what I remember\n"
+        f"/forget [key] — remove a memory\n\n"
         f"Or just chat with me! 💬"
     )
 
@@ -288,7 +318,7 @@ async def briefing_cmd(update, context):
 
 
 async def weekly_cmd(update, context):
-    await update.message.reply_text("Crunching your whole week... 📊")
+    await update.message.reply_text("Crunching your last 30 days... 📊")
     await update.message.reply_text(build_weekly_report())
 
 
@@ -321,23 +351,60 @@ async def status_cmd(update, context):
     meals = get_recent_meals(90)
     last_health = records[-1]["recorded_date"] if records else "never"
     last_meal = max(meals.keys()) if meals else "never"
-    today_raw = get_today_health_raw()
-    metric_count = len([k for k in today_raw if k in METRIC_MAP])
+    profile = get_user_profile()
     await update.message.reply_text(
         f"📡 DrWise Status\n\n"
         f"Health data: {len(records)} days in Supabase\n"
-        f"Last sync: {last_health}\n"
-        f"Metrics today: {metric_count}/{len(METRIC_MAP)} tracked\n\n"
+        f"Last sync: {last_health}\n\n"
         f"Meal data: {len(meals)} days in Supabase\n"
         f"Last meal: {last_meal}\n\n"
+        f"Memories: {len(profile.splitlines()) if profile else 0} notes\n\n"
         f"Storage: Supabase ✅ (persistent)"
     )
 
+
+async def remember_cmd(update, context):
+    """Save a note to user profile. Usage: /remember I had knee surgery in March 2026"""
+    text = " ".join(context.args)
+    if not text:
+        await update.message.reply_text(
+            "Usage: /remember [something important]\n"
+            "Example: /remember I had surgery and can't do high step counts yet"
+        )
+        return
+    # Use timestamp as key for general notes
+    key = f"note_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    save_profile_note(key, text)
+    await update.message.reply_text(f"✅ Got it, I'll remember that:\n\"{text}\"")
+
+
+async def memories_cmd(update, context):
+    """Show all saved memories."""
+    records = sb("GET", "user_profile", filters={"select": "key,value,updated_at", "order": "updated_at"})
+    if not records:
+        await update.message.reply_text("No memories saved yet.\nUse /remember to add notes!")
+        return
+    lines = ["🧠 What I remember about you:\n"]
+    for r in records:
+        lines.append(f"• [{r['key']}] {r['value']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def forget_cmd(update, context):
+    """Delete a memory by key. Usage: /forget note_20260405_123456"""
+    if not context.args:
+        await update.message.reply_text("Usage: /forget [key]\nUse /memories to see keys.")
+        return
+    key = context.args[0]
+    delete_profile_note(key)
+    await update.message.reply_text(f"🗑 Removed memory: {key}")
+
+
 async def handle_text(update, context):
     records = get_health_records(30)
-    week_summary = summarize_health_week(records)
+    health_summary = summarize_health_week(records)
     ctx = {
-        "week_health": week_summary,
+        "health_last_30_days": health_summary,
         "recent_meals": get_recent_meals(7),
         "goal": "lose weight"
     }
@@ -375,6 +442,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/meal":
+            # FatMaster already saved to Supabase — just react
             logger.info(f"Meal from FatMaster: {payload.get('meal', '?')}")
             if MY_CHAT_ID:
                 try:
@@ -408,7 +476,7 @@ async def send_weekly_report(context):
     if MY_CHAT_ID:
         await context.bot.send_message(
             chat_id=int(MY_CHAT_ID),
-            text=f"📊 Weekly Report\n\n{build_weekly_report()}"
+            text=f"📊 Monthly Report\n\n{build_weekly_report()}"
         )
 
 
@@ -423,6 +491,9 @@ def main():
     app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("remember", remember_cmd))
+    app.add_handler(CommandHandler("memories", memories_cmd))
+    app.add_handler(CommandHandler("forget", forget_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     jq = app.job_queue
     jq.run_repeating(drain_message_queue, interval=5, first=5)
