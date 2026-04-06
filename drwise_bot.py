@@ -173,7 +173,7 @@ LBS_TO_KG = {"Weight", "Lean Mass"}
 M_TO_CM = {"Step Length"}
 
 
-def extract_latest_value(metric_data):
+def extract_summary_value(metric_data):
     if not isinstance(metric_data, dict):
         return None
     data_arr = metric_data.get("data", [])
@@ -189,7 +189,7 @@ def summarize_health(raw: dict) -> dict:
     summary = {}
     for key, (label, unit) in METRIC_MAP.items():
         if key in raw:
-            val = extract_latest_value(raw[key])
+            val = extract_summary_value(raw[key], label)
             if val is not None:
                 try:
                     val = round(float(val), 2)
