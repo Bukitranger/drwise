@@ -39,6 +39,19 @@ CHANGELOG (2026-04-24, patch 4):
   * Meal char budget raised: 3000→6000 (handle_text) and 4000→10000
     (weekly report). Combined with compaction this lets Dr Wise see the
     last 2+ weeks of meals instead of only the last 3 days.
+
+CHANGELOG (2026-04-24, patch 5):
+  * handle_text now pulls 30 days of meals (was 7) so free-text questions
+    about multi-week nutrition trends have real data. Previously the bot
+    would hallucinate kcal totals for days outside the 7-day window.
+  * Meal char budget in handle_text: 8000 → 14000.
+  * System prompt now tells Claude to say 'no log' for days outside the
+    explicit meal_history_window_days, rather than inventing numbers.
+
+CHANGELOG (2026-04-24, patch 6):
+  * New /nutrition [days] command — computes per-day kcal + macros in pure
+    Python straight from the Supabase rows, with no Claude in the loop. Gives
+    Mark a ground-truth reference when the narrated answers look off.
 """
 
 import os
@@ -590,7 +603,12 @@ SLEEP DATA FORMAT:
   '6.03h asleep (deep 1.19, rem 1.58, core 3.26;  awake 1.40, in-bed 7.43)'
 - All values are hours. 'asleep' = deep + rem + core.
 - You DO have sleep-stage detail when this breakdown is present — talk about
-  deep/REM/core directly instead of saying the data isn't available."""
+  deep/REM/core directly instead of saying the data isn't available.
+
+MEAL DATA WINDOW:
+- When 'meal_history_window_days' is provided, DO NOT invent or guess numbers
+  for any day outside that window. If a day isn't in the data, say 'no log'
+  for that day rather than producing a made-up calorie figure."""
 
 
 def get_system_prompt() -> str:
@@ -670,6 +688,7 @@ async def start(update, context):
         f"/briefing — morning summary\n"
         f"/weekly — monthly report\n"
         f"/today — today's stats\n"
+        f"/nutrition [days] — exact kcal/macros totals (no AI)\n"
         f"/status — data status\n"
         f"/remember [note] — save something important\n"
         f"/memories — see what I remember\n"
@@ -735,6 +754,116 @@ async def status_cmd(update, context):
     )
 
 
+async def nutrition_cmd(update, context):
+    """Deterministic per-day nutrition totals. No LLM in the loop — pure Python
+       arithmetic over the Supabase rows. Exists so the user has a ground-truth
+       reference when DrWise's narrative answers look off.
+
+       Usage:
+         /nutrition          → last 7 days
+         /nutrition 14       → last 14 days
+         /nutrition 30       → last 30 days (max 90)
+    """
+    try:
+        days = int(context.args[0]) if context.args else 7
+    except (ValueError, TypeError):
+        days = 7
+    days = max(1, min(days, 90))
+
+    # Inclusive of today: last 7 days = today + 6 prior.
+    cutoff = str(today_jst() - timedelta(days=days - 1))
+    records = sb("GET", "meals", filters={
+        "recorded_date": f"gte.{cutoff}",
+        "order": "recorded_date,created_at",
+        "select": "recorded_date,data"
+    })
+    if not records:
+        await update.message.reply_text(
+            f"📊 No meals logged in the last {days} days."
+        )
+        return
+
+    def _num(x):
+        try:
+            return float(x) if x is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    per_day: dict[str, dict] = {}
+    for r in records:
+        d = r["recorded_date"]
+        m = r.get("data") or {}
+        bucket = per_day.setdefault(d, {"kcal": 0.0, "protein": 0.0,
+                                        "carbs": 0.0, "fat": 0.0,
+                                        "fiber": 0.0, "n_meals": 0})
+        bucket["kcal"]    += _num(m.get("calories"))
+        bucket["protein"] += _num(m.get("protein"))
+        bucket["carbs"]   += _num(m.get("carbs"))
+        bucket["fat"]     += _num(m.get("fat"))
+        bucket["fiber"]   += _num(m.get("fiber"))
+        bucket["n_meals"] += 1
+
+    sorted_days = sorted(per_day.keys(), reverse=True)  # newest first
+    lines = [f"📊 Nutrition — last {days} days", ""]
+    lines.append("Per day (newest first):")
+    for d in sorted_days:
+        b = per_day[d]
+        # "Apr 23" style label for readability — year is implied.
+        try:
+            short = datetime.strptime(d, "%Y-%m-%d").strftime("%b %d").replace(" 0", " ")
+        except Exception:
+            short = d
+        lines.append(
+            f"• {short}: {b['kcal']:,.0f} kcal · "
+            f"{b['protein']:.0f}g P · {b['carbs']:.0f}g C · {b['fat']:.0f}g F "
+            f"({b['n_meals']} meal{'s' if b['n_meals'] != 1 else ''})"
+        )
+
+    logged = len(per_day)
+    tot_kcal = sum(b["kcal"] for b in per_day.values())
+    tot_prot = sum(b["protein"] for b in per_day.values())
+    tot_carb = sum(b["carbs"] for b in per_day.values())
+    tot_fat  = sum(b["fat"]  for b in per_day.values())
+
+    lines.append("")
+    lines.append(f"Days with logs: {logged}/{days}")
+    lines.append(
+        f"Totals: {tot_kcal:,.0f} kcal · {tot_prot:.0f}g P · "
+        f"{tot_carb:.0f}g C · {tot_fat:.0f}g F"
+    )
+    lines.append(
+        f"Avg over {logged} logged day{'s' if logged != 1 else ''}: "
+        f"{tot_kcal/logged:,.0f} kcal · {tot_prot/logged:.0f}g P"
+    )
+    if logged < days:
+        lines.append(
+            f"Avg over all {days} days (no-log = 0): "
+            f"{tot_kcal/days:,.0f} kcal"
+        )
+
+    max_day = max(sorted_days, key=lambda d: per_day[d]["kcal"])
+    min_day = min(sorted_days, key=lambda d: per_day[d]["kcal"])
+    lines.append("")
+    lines.append(f"Max: {per_day[max_day]['kcal']:,.0f} kcal on {max_day}")
+    lines.append(f"Min: {per_day[min_day]['kcal']:,.0f} kcal on {min_day}")
+    lines.append("")
+    lines.append("(computed in Python, no AI — this is the source of truth)")
+
+    # Telegram caps messages at 4096 chars. Per-day lines are ~80 chars, so
+    # 90 days × 80 ≈ 7200 — can exceed. Split if needed.
+    full = "\n".join(lines)
+    if len(full) <= 4000:
+        await update.message.reply_text(full)
+    else:
+        # Send header+per-day in one message, totals in another.
+        split_idx = full.find("\n\nDays with logs:")
+        if split_idx == -1:
+            await update.message.reply_text(full[:4000])
+        else:
+            await update.message.reply_text(full[:split_idx])
+            await update.message.reply_text(full[split_idx + 2:])
+
+
 async def remember_cmd(update, context):
     text = " ".join(context.args)
     if not text:
@@ -769,27 +898,33 @@ async def forget_cmd(update, context):
 
 
 async def handle_text(update, context):
+    # Pull 30 days of both health and meals so questions like "average over the
+    # past 2 weeks" have data to work with. Previously meals were capped at 7
+    # days, which meant the bot hallucinated numbers when asked about longer
+    # windows. Compacted meals at ~150 chars each fit 30 days well under 14k.
     records = get_health_records(30)
     health_summary = summarize_health_week(records)
     today_meals = get_today_meals()
-    recent_meals = get_recent_meals(7)
+    recent_meals = get_recent_meals(30)
 
-    # Health + meals are ordered newest-first by their helpers, so truncating
-    # from the tail drops oldest data — which is what we want. Meals are also
-    # compacted (name + macros only, no raw LLM blurb) so a week's worth fits.
+    # Both sources are ordered newest-first by their helpers, so truncating
+    # from the tail drops oldest data.
     health_str = json.dumps(health_summary, default=str)
     if len(health_str) > 8000:
         health_str = health_str[:8000] + "... [older days truncated]"
 
     recent_meals_str = json.dumps(recent_meals, default=str)
-    if len(recent_meals_str) > 8000:
-        recent_meals_str = recent_meals_str[:8000] + "... [older meals truncated]"
+    if len(recent_meals_str) > 14000:
+        recent_meals_str = recent_meals_str[:14000] + "... [older meals truncated]"
 
     ctx = {
         "health_last_30_days": health_str,
         "todays_meals": today_meals,  # always full, never truncated
-        "recent_meals_history": recent_meals_str,
-        "goal": "lose weight"
+        "recent_meals_last_30_days": recent_meals_str,
+        "goal": "lose weight",
+        # Tell Claude exactly how far back the meal data reaches so it won't
+        # invent numbers for days outside the window.
+        "meal_history_window_days": 30,
     }
     await update.message.reply_text(ask_claude(update.message.text, ctx))
 
@@ -873,6 +1008,7 @@ def main():
     app.add_handler(CommandHandler("briefing", briefing_cmd))
     app.add_handler(CommandHandler("weekly", weekly_cmd))
     app.add_handler(CommandHandler("today", today_cmd))
+    app.add_handler(CommandHandler("nutrition", nutrition_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("remember", remember_cmd))
     app.add_handler(CommandHandler("memories", memories_cmd))
