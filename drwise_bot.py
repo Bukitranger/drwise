@@ -25,6 +25,20 @@ CHANGELOG (2026-04-24, patch 2):
     weekly report 5000→8000 / 3000→4000.
   * System prompt now tells Claude that data is newest-first and to anchor
     'current' / 'latest' values on the first dated entry.
+
+CHANGELOG (2026-04-24, patch 3):
+  * Sleep now reports DEEP / REM / CORE / AWAKE / IN-BED breakdown for both
+    Apple-segmented and Oura-summary payload shapes, in a compact single-line
+    string DrWise can read directly. The old code surfaced only a single
+    'X hr' value so the bot told the user it couldn't see stage detail.
+
+CHANGELOG (2026-04-24, patch 4):
+  * Added compact_meal() to strip FatMaster's verbose `raw` dump and long
+    `notes` from each meal record before sending to Claude. Typical meal
+    went from ~700 chars to ~100 chars — about a 7x reduction.
+  * Meal char budget raised: 3000→6000 (handle_text) and 4000→10000
+    (weekly report). Combined with compaction this lets Dr Wise see the
+    last 2+ weeks of meals instead of only the last 3 days.
 """
 
 import os
@@ -133,6 +147,35 @@ def get_today_health_raw():
 
 
 # ── Meal data ─────────────────────────────────────────────────────────────────
+#
+# FatMaster stores each meal as a chunky jsonb object (~700 chars): it keeps
+# macros as numbers AND duplicates them as a text `raw` field plus a `notes`
+# commentary. For context windows we only need the numbers and the name, so
+# we compact before sending to Claude. This lets us fit 2+ weeks of meals in
+# budget instead of 3 days.
+
+def compact_meal(raw: dict) -> dict:
+    """Strip verbose fields from a FatMaster meal record. Keeps what Dr Wise
+       actually needs to reason about nutrition trends."""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    name = raw.get("meal") or raw.get("name") or raw.get("description")
+    if name:
+        out["meal"] = name
+    # Prefer HH:MM in JST rather than full ISO timestamp.
+    t = raw.get("time")
+    if isinstance(t, str) and len(t) >= 16:
+        out["time"] = t[11:16]  # "2026-04-23T10:42:37..." → "10:42"
+    for k in ("calories", "protein", "carbs", "fat", "fiber"):
+        if k in raw and raw[k] is not None:
+            out[k] = raw[k]
+    # Keep a short note only if it adds signal beyond macros (e.g. small portion).
+    note = raw.get("notes")
+    if isinstance(note, str) and note.strip() and len(note) < 120:
+        out["notes"] = note.strip()
+    return out
+
 
 def get_recent_meals(days=7):
     cutoff = str(today_jst() - timedelta(days=days))
@@ -148,7 +191,7 @@ def get_recent_meals(days=7):
     result = {}
     for r in records_sorted:
         d = r["recorded_date"]
-        result.setdefault(d, []).append(r["data"])
+        result.setdefault(d, []).append(compact_meal(r["data"]))
     return result
 
 
@@ -158,7 +201,7 @@ def get_today_meals():
         "order": "created_at",
         "select": "data"
     })
-    return [r["data"] for r in records] if records else []
+    return [compact_meal(r["data"]) for r in records] if records else []
 
 
 # ── Health summarizer ─────────────────────────────────────────────────────────
@@ -315,14 +358,29 @@ def should_convert(source_unit: str | None, target_unit: str) -> bool:
 
 # ── Sleep (special-cased because HAE sends it in two different shapes) ───────
 
-def extract_sleep_hours(metric_data: dict) -> float | None:
-    """HAE sleep comes in two formats:
-       A) Apple segmented — many rows, each with `qty` = hours of that segment
-          and `value` = stage ("Core", "Deep", "REM", "Awake", "In Bed").
-          → sum the `qty` where stage is an actual sleep stage.
-       B) Oura / Withings summary — one row with `totalSleep` / `asleep`
-          / `inBed` pre-aggregated in hours.
-          → prefer `totalSleep`, fall back to `asleep`, then `inBed`.
+def extract_sleep_breakdown(metric_data: dict) -> dict | None:
+    """HAE sleep arrives in two shapes. We want the SAME structured output
+    from both so Claude can talk about stages:
+
+        {
+          "total": 6.0,   # hours asleep (Core + Deep + REM, or totalSleep)
+          "deep":  1.2,
+          "rem":   1.6,
+          "core":  3.3,
+          "awake": 1.4,   # optional
+          "in_bed": 7.4,  # optional
+        }
+
+    Shape A — Apple segmented:
+        ~80 short rows, each `{"qty": hours, "value": "Core"|"Deep"|"REM"|"Awake"|"In Bed"}`
+        → sum qty grouped by stage.
+
+    Shape B — Oura/Withings summary:
+        one row with pre-aggregated fields `rem`, `core`, `deep`, `awake`,
+        `inBed`, `asleep`, `totalSleep`.
+        → copy fields directly.
+
+    Keys that end up zero are dropped from the output.
     """
     if not isinstance(metric_data, dict):
         return None
@@ -330,41 +388,91 @@ def extract_sleep_hours(metric_data: dict) -> float | None:
     if not isinstance(rows, list) or not rows:
         return None
 
-    # Shape B: single summary row
-    if len(rows) == 1 and isinstance(rows[0], dict):
-        r = rows[0]
-        for key in ("totalSleep", "asleep", "inBed"):
-            v = r.get(key)
-            if v is not None:
-                try:
-                    fv = float(v)
-                    if fv > 0:
-                        return round(fv, 2)
-                except (TypeError, ValueError):
-                    pass
-        # Fall through to shape-A handling in case it's segmented despite length 1.
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
 
-    # Shape A: segmented rows
-    asleep_stages = {"core", "deep", "rem", "asleep"}
-    total = 0.0
+    # Shape B: single summary row that has at least one of the summary fields.
+    summary_fields = ("rem", "core", "deep", "awake", "inBed", "asleep", "totalSleep")
+    if len(rows) == 1 and isinstance(rows[0], dict) and any(k in rows[0] for k in summary_fields):
+        r = rows[0]
+        total = _f(r.get("totalSleep"))
+        if total is None or total == 0:
+            total = _f(r.get("asleep"))
+        # If still no total but we have stage breakdown, derive it.
+        if total is None or total == 0:
+            stages_sum = sum(_f(r.get(k)) or 0 for k in ("core", "deep", "rem"))
+            total = stages_sum or None
+
+        out = {}
+        if total:
+            out["total"] = round(total, 2)
+        for src, dst in (("deep", "deep"), ("rem", "rem"), ("core", "core"),
+                         ("awake", "awake"), ("inBed", "in_bed")):
+            v = _f(r.get(src))
+            if v and v > 0:
+                out[dst] = round(v, 2)
+        return out or None
+
+    # Shape A: segmented rows grouped by `value`.
+    totals = {"deep": 0.0, "rem": 0.0, "core": 0.0, "awake": 0.0, "in_bed": 0.0}
+    stage_map = {
+        "deep": "deep",
+        "rem": "rem",
+        "core": "core",
+        "asleep": "core",       # older Apple Health label
+        "awake": "awake",
+        "in bed": "in_bed",
+    }
     saw_any = False
     for r in rows:
         if not isinstance(r, dict):
             continue
-        stage = str(r.get("value", "")).strip().lower()
-        qty = r.get("qty")
+        qty = _f(r.get("qty"))
         if qty is None:
             continue
-        try:
-            qty = float(qty)
-        except (TypeError, ValueError):
-            continue
         saw_any = True
-        if stage in asleep_stages:
-            total += qty
+        stage_key = stage_map.get(str(r.get("value", "")).strip().lower())
+        if stage_key:
+            totals[stage_key] += qty
+
     if not saw_any:
         return None
-    return round(total, 2)
+
+    asleep_total = totals["deep"] + totals["rem"] + totals["core"]
+    out = {}
+    if asleep_total > 0:
+        out["total"] = round(asleep_total, 2)
+    for k in ("deep", "rem", "core", "awake", "in_bed"):
+        if totals[k] > 0:
+            out[k] = round(totals[k], 2)
+    return out or None
+
+
+def format_sleep_breakdown(breakdown: dict) -> str:
+    """Compact human-readable + Claude-parseable format for the summary dict.
+       Example: '6.03h asleep (deep 1.19, rem 1.58, core 3.26; awake 1.40, in-bed 7.43)'
+    """
+    if not breakdown:
+        return ""
+    parts = []
+    if "total" in breakdown:
+        parts.append(f"{breakdown['total']}h asleep")
+    stage_bits = []
+    for k, label in (("deep", "deep"), ("rem", "rem"), ("core", "core")):
+        if k in breakdown:
+            stage_bits.append(f"{label} {breakdown[k]}")
+    extra_bits = []
+    for k, label in (("awake", "awake"), ("in_bed", "in-bed")):
+        if k in breakdown:
+            extra_bits.append(f"{label} {breakdown[k]}")
+    if stage_bits:
+        parts.append("(" + ", ".join(stage_bits) + (";  " + ", ".join(extra_bits) if extra_bits else "") + ")")
+    elif extra_bits:
+        parts.append("(" + ", ".join(extra_bits) + ")")
+    return " ".join(parts)
 
 
 # ── Generic metric extraction ────────────────────────────────────────────────
@@ -416,11 +524,12 @@ def summarize_health(raw: dict) -> dict:
         metric_payload = raw[key]
         source_unit = metric_payload.get("units") if isinstance(metric_payload, dict) else None
 
-        # Sleep needs a custom aggregator.
+        # Sleep needs a custom aggregator that keeps the stage breakdown.
         if key == "sleep_analysis":
-            hours = extract_sleep_hours(metric_payload)
-            if hours is not None and hours > 0:
-                summary[label] = f"{hours} hr"
+            breakdown = extract_sleep_breakdown(metric_payload)
+            formatted = format_sleep_breakdown(breakdown) if breakdown else ""
+            if formatted:
+                summary[label] = formatted
             continue
 
         val = extract_summary_value(metric_payload, label)
@@ -474,7 +583,14 @@ DATA ORDERING:
 - The health and meal data you receive is sorted NEWEST DATE FIRST.
 - When asked about 'current' / 'latest' / 'today' values, use the first dated
   entry in the data, not the last. Do not anchor on older entries.
-- Older entries may be truncated at the end — the tail is least recent."""
+- Older entries may be truncated at the end — the tail is least recent.
+
+SLEEP DATA FORMAT:
+- The 'Sleep' field is a compact string like:
+  '6.03h asleep (deep 1.19, rem 1.58, core 3.26;  awake 1.40, in-bed 7.43)'
+- All values are hours. 'asleep' = deep + rem + core.
+- You DO have sleep-stage detail when this breakdown is present — talk about
+  deep/REM/core directly instead of saying the data isn't available."""
 
 
 def get_system_prompt() -> str:
@@ -514,8 +630,9 @@ def build_weekly_report():
     health_summary = summarize_health_week(records)
     meals = get_recent_meals(30)
     # Newest-first ordering already done by helpers; truncate tail = drop oldest.
+    # Meals are compacted already, so a full 30 days fits under 10k.
     health_str = json.dumps(health_summary, default=str)[:8000]
-    meals_str = json.dumps(meals, default=str)[:4000]
+    meals_str = json.dumps(meals, default=str)[:10000]
     return ask_claude(
         "Give me my monthly health report. Analyze sleep patterns, nutrition trends, activity levels, "
         "body metric changes over the past 30 days. What are the key trends? What needs work? "
@@ -658,14 +775,15 @@ async def handle_text(update, context):
     recent_meals = get_recent_meals(7)
 
     # Health + meals are ordered newest-first by their helpers, so truncating
-    # from the tail drops oldest data — which is what we want.
+    # from the tail drops oldest data — which is what we want. Meals are also
+    # compacted (name + macros only, no raw LLM blurb) so a week's worth fits.
     health_str = json.dumps(health_summary, default=str)
     if len(health_str) > 8000:
         health_str = health_str[:8000] + "... [older days truncated]"
 
     recent_meals_str = json.dumps(recent_meals, default=str)
-    if len(recent_meals_str) > 3000:
-        recent_meals_str = recent_meals_str[:3000] + "... [older meals truncated]"
+    if len(recent_meals_str) > 8000:
+        recent_meals_str = recent_meals_str[:8000] + "... [older meals truncated]"
 
     ctx = {
         "health_last_30_days": health_str,
