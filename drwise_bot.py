@@ -15,6 +15,16 @@ CHANGELOG (2026-04-24):
   * Added a few extra metrics (apple_stand_hour, environmental_audio_exposure,
     time_in_daylight, apple_walking_steadiness, physical_effort) so they flow
     through to Claude when present.
+
+CHANGELOG (2026-04-24, patch 2):
+  * Health + meal summaries are now ordered NEWEST-FIRST so the char-budget
+    truncation drops oldest days rather than the most recent ones. Previously
+    the bot would quote 3-week-old weights as 'current' because today's data
+    sat past the cutoff.
+  * Char budgets raised: health 4000→8000, meals 2000→3000 in handle_text;
+    weekly report 5000→8000 / 3000→4000.
+  * System prompt now tells Claude that data is newest-first and to anchor
+    'current' / 'latest' values on the first dated entry.
 """
 
 import os
@@ -133,8 +143,10 @@ def get_recent_meals(days=7):
     })
     if not records:
         return {}
+    # Sort newest-first so downstream truncation drops oldest, not newest.
+    records_sorted = sorted(records, key=lambda r: r.get("recorded_date", ""), reverse=True)
     result = {}
-    for r in records:
+    for r in records_sorted:
         d = r["recorded_date"]
         result.setdefault(d, []).append(r["data"])
     return result
@@ -429,7 +441,16 @@ def summarize_health(raw: dict) -> dict:
 
 
 def summarize_health_week(records) -> dict:
-    return {r["recorded_date"]: summarize_health(r.get("data", {})) for r in records}
+    """Produce a per-day summary, NEWEST DATE FIRST.
+
+    Ordering matters: the JSON we build from this dict is later truncated to a
+    char budget before being sent to Claude. If the oldest days come first in
+    the dict, the newest days get cut off the end — which is exactly what led
+    DrWise to quote 3-week-old weights as 'current'. Latest-first ordering
+    ensures truncation only drops the least relevant (oldest) days.
+    """
+    records_sorted = sorted(records, key=lambda r: r.get("recorded_date", ""), reverse=True)
+    return {r["recorded_date"]: summarize_health(r.get("data", {})) for r in records_sorted}
 
 
 # ── Claude AI ─────────────────────────────────────────────────────────────────
@@ -447,7 +468,13 @@ IMPORTANT USER PREFERENCES:
 - Distances in KILOMETERS (km). Never miles.
 - User is in Tokyo, Japan (JST = UTC+9).
 - Weight and body composition from Withings scale.
-- Sleep and recovery from Oura Ring."""
+- Sleep and recovery from Oura Ring.
+
+DATA ORDERING:
+- The health and meal data you receive is sorted NEWEST DATE FIRST.
+- When asked about 'current' / 'latest' / 'today' values, use the first dated
+  entry in the data, not the last. Do not anchor on older entries.
+- Older entries may be truncated at the end — the tail is least recent."""
 
 
 def get_system_prompt() -> str:
@@ -486,12 +513,14 @@ def build_weekly_report():
     records = get_health_records(30)
     health_summary = summarize_health_week(records)
     meals = get_recent_meals(30)
-    health_str = json.dumps(health_summary, default=str)[:5000]
-    meals_str = json.dumps(meals, default=str)[:3000]
+    # Newest-first ordering already done by helpers; truncate tail = drop oldest.
+    health_str = json.dumps(health_summary, default=str)[:8000]
+    meals_str = json.dumps(meals, default=str)[:4000]
     return ask_claude(
         "Give me my monthly health report. Analyze sleep patterns, nutrition trends, activity levels, "
         "body metric changes over the past 30 days. What are the key trends? What needs work? "
-        "3 specific goals for the coming weeks.",
+        "3 specific goals for the coming weeks. "
+        "The data is ordered NEWEST FIRST — use the first dated entry as the current state.",
         {"month_health": health_str, "month_meals": meals_str, "goal": "lose weight"}
     )
 
@@ -628,13 +657,15 @@ async def handle_text(update, context):
     today_meals = get_today_meals()
     recent_meals = get_recent_meals(7)
 
+    # Health + meals are ordered newest-first by their helpers, so truncating
+    # from the tail drops oldest data — which is what we want.
     health_str = json.dumps(health_summary, default=str)
-    if len(health_str) > 4000:
-        health_str = health_str[:4000] + "... [truncated]"
+    if len(health_str) > 8000:
+        health_str = health_str[:8000] + "... [older days truncated]"
 
     recent_meals_str = json.dumps(recent_meals, default=str)
-    if len(recent_meals_str) > 2000:
-        recent_meals_str = recent_meals_str[:2000] + "... [truncated]"
+    if len(recent_meals_str) > 3000:
+        recent_meals_str = recent_meals_str[:3000] + "... [older meals truncated]"
 
     ctx = {
         "health_last_30_days": health_str,
